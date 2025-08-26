@@ -1,0 +1,74 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Test Environment",
+			"type": "shell",
+			"command": ".venv\\Scripts\\python.exe",
+			"args": ["test_environment.py"],
+			"group": "test",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			},
+			"problemMatcher": ["$python"]
+		},
+		{
+			"label": "Run Portal Analysis (Modern UI)",
+			"type": "shell",
+			"command": ".venv\\Scripts\\python.exe",
+			"args": ["portal_modern_ui.py"],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			},
+			"problemMatcher": ["$python"]
+		},
+		{
+			"label": "Run Portal Analysis (Console)",
+			"type": "shell",
+			"command": ".venv\\Scripts\\python.exe",
+			"args": ["portal.py"],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			},
+			"problemMatcher": ["$python"]
+		},
+		{
+			"label": "Run Portal Analysis (Jupyter)",
+			"type": "shell",
+			"command": ".venv\\Scripts\\jupyter",
+			"args": ["notebook", "portal_interactive.ipynb"],
+			"group": "build",
+			"isBackground": true,
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			}
+		},
+		{
+			"label": "Install Dependencies",
+			"type": "shell",
+			"command": ".venv\\Scripts\\python.exe",
+			"args": ["-m", "pip", "install", "-r", "requirements.txt"],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared"
+			}
+		}
+	]
+}
