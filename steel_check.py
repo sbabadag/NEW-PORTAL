@@ -429,3 +429,160 @@ def format_optimization_results(opt_results):
     result_text += f"\n{'='*60}\n"
     
     return result_text
+
+def get_hea_sections():
+    """Get list of HEA section names from database"""
+    return [name for name in STEEL_SECTIONS.keys() if name.startswith("HEA")]
+
+def get_ipe_sections():
+    """Get list of IPE section names from database"""
+    return [name for name in STEEL_SECTIONS.keys() if name.startswith("IPE")]
+
+def get_all_sections():
+    """Get list of all section names from database"""
+    return list(STEEL_SECTIONS.keys())
+
+def get_section_type_list(section_type):
+    """Get list of sections by type (HEA or IPE)"""
+    if section_type.upper() == "HEA":
+        return get_hea_sections()
+    elif section_type.upper() == "IPE":
+        return get_ipe_sections()
+    else:
+        return get_all_sections()
+
+def optimize_portal_frame_total_weight(max_N_beam, max_V_beam, max_M_beam, 
+                                      max_N_column, max_V_column, max_M_column,
+                                      steel_grade, design_code, 
+                                      beam_length, column_length, num_columns,
+                                      beam_section_types=None, column_section_types=None):
+    """
+    Optimize entire portal frame for minimum total weight
+    
+    Parameters:
+    - max_N_beam, max_V_beam, max_M_beam: Maximum forces for beam
+    - max_N_column, max_V_column, max_M_column: Maximum forces for column
+    - steel_grade: Steel grade (S235, S275, S355)
+    - design_code: Design code
+    - beam_length: Total length of beams (m)
+    - column_length: Total length of columns (m) 
+    - num_columns: Number of columns
+    - beam_section_types: List of section types to consider for beam ["IPE", "HEA"] or None for all
+    - column_section_types: List of section types to consider for column ["IPE", "HEA"] or None for all
+    
+    Returns:
+    - dict with optimal combination and total weight
+    """
+    print(f"DEBUG: Portal frame total weight optimization starting...")
+    print(f"  Beam length: {beam_length:.2f} m")
+    print(f"  Column length: {column_length:.2f} m")  
+    print(f"  Number of columns: {num_columns}")
+    print(f"  Total beam length: {beam_length:.2f} m")
+    print(f"  Total column length: {column_length * num_columns:.2f} m")
+    
+    # Get available sections
+    all_sections = list(STEEL_SECTIONS.keys())
+    
+    # Filter sections by type if specified
+    beam_sections = all_sections
+    if beam_section_types:
+        beam_sections = [s for s in all_sections if any(s.startswith(t) for t in beam_section_types)]
+    
+    column_sections = all_sections  
+    if column_section_types:
+        column_sections = [s for s in all_sections if any(s.startswith(t) for t in column_section_types)]
+    
+    print(f"  Considering {len(beam_sections)} beam sections and {len(column_sections)} column sections")
+    
+    best_combination = None
+    min_total_weight = float('inf')
+    safe_combinations = []
+    
+    total_combinations = len(beam_sections) * len(column_sections)
+    checked_combinations = 0
+    
+    for beam_section in beam_sections:
+        # Check beam section safety
+        beam_check = check_section_resistance(beam_section, {"S235": 235, "S275": 275, "S355": 355}[steel_grade], 
+                                            max_M_beam, max_N_beam, design_code, max_V_beam)
+        
+        if not beam_check.get('safety', False):
+            continue  # Skip unsafe beam sections
+            
+        for column_section in column_sections:
+            checked_combinations += 1
+            if checked_combinations % 50 == 0:
+                print(f"  Progress: {checked_combinations}/{total_combinations} combinations checked...")
+            
+            # Check column section safety
+            column_check = check_section_resistance(column_section, {"S235": 235, "S275": 275, "S355": 355}[steel_grade],
+                                                  max_M_column, max_N_column, design_code, max_V_column)
+            
+            if not column_check.get('safety', False):
+                continue  # Skip unsafe column sections
+                
+            # Calculate total weight for this combination
+            beam_props = get_section_properties(beam_section)
+            column_props = get_section_properties(column_section)
+            
+            if beam_props is None or column_props is None:
+                continue
+                
+            # Weight per meter (kg/m) = Area (m²) × 7850 (kg/m³)
+            beam_weight_per_m = beam_props['A'] * 7850  # kg/m
+            column_weight_per_m = column_props['A'] * 7850  # kg/m
+            
+            total_beam_weight = beam_weight_per_m * beam_length
+            total_column_weight = column_weight_per_m * column_length * num_columns
+            total_weight = total_beam_weight + total_column_weight
+            
+            # Store safe combination
+            combination = {
+                'beam_section': beam_section,
+                'column_section': column_section,
+                'total_weight': total_weight,
+                'beam_weight': total_beam_weight,
+                'column_weight': total_column_weight,
+                'beam_utilization': beam_check.get('utilization', 0),
+                'column_utilization': column_check.get('utilization', 0),
+                'beam_weight_per_m': beam_weight_per_m,
+                'column_weight_per_m': column_weight_per_m
+            }
+            safe_combinations.append(combination)
+            
+            # Update best combination
+            if total_weight < min_total_weight:
+                min_total_weight = total_weight
+                best_combination = combination
+    
+    print(f"DEBUG: Portal frame optimization completed")
+    print(f"  Total combinations checked: {checked_combinations}")
+    print(f"  Safe combinations found: {len(safe_combinations)}")
+    
+    if not safe_combinations:
+        return {
+            'status': 'FAILED',
+            'message': 'No safe section combinations found',
+            'total_combinations_checked': checked_combinations
+        }
+    
+    # Sort combinations by total weight
+    safe_combinations.sort(key=lambda x: x['total_weight'])
+    
+    result = {
+        'status': 'SUCCESS',
+        'optimal_combination': best_combination,
+        'min_total_weight': min_total_weight,
+        'safe_combinations': safe_combinations[:10],  # Top 10 alternatives
+        'total_safe_combinations': len(safe_combinations),
+        'total_combinations_checked': checked_combinations,
+        'steel_grade': steel_grade,
+        'design_code': design_code
+    }
+    
+    print(f"  Optimal combination:")
+    print(f"    Beam: {best_combination['beam_section']} ({best_combination['beam_weight_per_m']:.1f} kg/m)")
+    print(f"    Column: {best_combination['column_section']} ({best_combination['column_weight_per_m']:.1f} kg/m)")
+    print(f"    Total weight: {best_combination['total_weight']:.1f} kg")
+    
+    return result

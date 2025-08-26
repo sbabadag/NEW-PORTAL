@@ -13,9 +13,10 @@ from math import atan2, cos
 import tkinter as tk
 from tkinter import ttk
 import threading
+from tkinter import messagebox
 
 # Import steel section checking functions
-from steel_check import check_section_resistance, format_check_results, get_section_properties, optimize_section_selection, format_optimization_results
+from steel_check import check_section_resistance, format_check_results, get_section_properties, optimize_section_selection, format_optimization_results, get_hea_sections, get_ipe_sections, get_all_sections, optimize_portal_frame_total_weight
 
 # Set appearance mode and color theme
 ctk.set_appearance_mode("dark")  # Modes: "System" (standard), "Dark", "Light"
@@ -343,11 +344,13 @@ class ModernPortalAnalyzer(ctk.CTk):
         # Column section
         self.col_section_label = ctk.CTkLabel(self.sidebar_frame, text="Kolon kesit:")
         self.col_section_label.grid(row=8, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        
+        # Get all sections from database (HEA + IPE for flexibility)
+        all_sections = get_all_sections()
+        all_sections.append("Özel")  # Add custom option
+        
         self.col_section_combo = ctk.CTkComboBox(self.sidebar_frame, 
-                                               values=["HEA 100", "HEA 120", "HEA 140", "HEA 160", "HEA 180", "HEA 200", 
-                                                      "HEA 220", "HEA 240", "HEA 260", "HEA 280", "HEA 300", "HEA 320",
-                                                      "HEA 340", "HEA 360", "HEA 400", "HEA 450", "HEA 500", "HEA 550",
-                                                      "HEA 600", "HEA 650", "HEA 700", "HEA 800", "HEA 900", "HEA 1000", "Özel"],
+                                               values=all_sections,
                                                width=120,
                                                command=self.update_column_properties)
         self.col_section_combo.grid(row=8, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
@@ -367,10 +370,13 @@ class ModernPortalAnalyzer(ctk.CTk):
         # Rafter section
         self.raf_section_label = ctk.CTkLabel(self.sidebar_frame, text="Kiriş kesit:")
         self.raf_section_label.grid(row=11, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        
+        # Get all sections from database (IPE + HEA for flexibility)
+        all_sections_beam = get_all_sections()
+        all_sections_beam.append("Özel")  # Add custom option
+        
         self.raf_section_combo = ctk.CTkComboBox(self.sidebar_frame,
-                                               values=["IPE 80", "IPE 100", "IPE 120", "IPE 140", "IPE 160", "IPE 180",
-                                                      "IPE 200", "IPE 220", "IPE 240", "IPE 270", "IPE 300", "IPE 330",
-                                                      "IPE 360", "IPE 400", "IPE 450", "IPE 500", "IPE 550", "IPE 600", "IPE 750", "Özel"],
+                                               values=all_sections_beam,
                                                width=120,
                                                command=self.update_beam_properties)
         self.raf_section_combo.grid(row=11, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
@@ -534,7 +540,7 @@ class ModernPortalAnalyzer(ctk.CTk):
                 self.Acol_entry.delete(0, "end")
                 self.Acol_entry.insert(0, f"{props['A']*1e4:.1f}")
                 self.Icol_entry.delete(0, "end")
-                self.Icol_entry.insert(0, f"{props['I_y']*1e8:.0f}")
+                self.Icol_entry.insert(0, f"{props['I']*1e8:.0f}")
             except:
                 pass  # Keep existing values if section not found
     
@@ -546,7 +552,7 @@ class ModernPortalAnalyzer(ctk.CTk):
                 self.Araf_entry.delete(0, "end")
                 self.Araf_entry.insert(0, f"{props['A']*1e4:.1f}")
                 self.Iraf_entry.delete(0, "end")
-                self.Iraf_entry.insert(0, f"{props['I_y']*1e8:.0f}")
+                self.Iraf_entry.insert(0, f"{props['I']*1e8:.0f}")
             except:
                 pass  # Keep existing values if section not found
     
@@ -980,7 +986,7 @@ class ModernPortalAnalyzer(ctk.CTk):
         text_widget.configure(state="disabled")
 
     def optimize_sections(self):
-        """Run optimization to find the lightest steel sections"""
+        """Run optimization to find the lightest steel sections for total frame weight"""
         if not hasattr(self, 'current_analysis') or not self.current_analysis:
             self.status_label.configure(text="Önce analiz yapın!")
             return
@@ -991,42 +997,69 @@ class ModernPortalAnalyzer(ctk.CTk):
             design_code = self.design_code_combo.get()
             fy = {"S235": 235, "S275": 275, "S355": 355}[steel_grade]
             
-            self.status_label.configure(text="Optimizasyon yapılıyor...")
+            # Calculate frame geometry
+            geometry = self.calculate_frame_geometry()
+            if geometry is None:
+                self.status_label.configure(text="Geometri hesaplama hatası!")
+                return
+            
+            # Get current section selections to determine optimization types
+            current_beam_section = self.raf_section_combo.get()
+            current_column_section = self.col_section_combo.get()
+            
+            # Determine section types for optimization
+            beam_types = []
+            column_types = []
+            
+            if current_beam_section.startswith("IPE") or current_beam_section == "Özel":
+                beam_types.append("IPE")
+            if current_beam_section.startswith("HEA"):
+                beam_types.append("HEA")
+            if not beam_types:  # Default to both types
+                beam_types = ["IPE", "HEA"]
+                
+            if current_column_section.startswith("HEA") or current_column_section == "Özel":
+                column_types.append("HEA") 
+            if current_column_section.startswith("IPE"):
+                column_types.append("IPE")
+            if not column_types:  # Default to both types
+                column_types = ["IPE", "HEA"]
+            
+            self.status_label.configure(text="Toplam ağırlık optimizasyonu yapılıyor...")
             
             # Debug information
             print(f"Current analysis: {self.current_analysis}")
             print(f"Max moment beam: {self.current_analysis['max_moment_beam']}")
             print(f"Max moment column: {self.current_analysis['max_moment_column']}")
             print(f"Max axial column: {self.current_analysis['max_axial_column']}")
+            print(f"Beam optimization types: {beam_types} (current: {current_beam_section})")
+            print(f"Column optimization types: {column_types} (current: {current_column_section})")
             
-            # Run optimization for beam (IPE sections)
-            optimization_result = optimize_section_selection(
-                max_N=0,  # Beam has no axial load
-                max_V=50,  # Approximate shear force (N)
-                max_M=self.current_analysis['max_moment_beam'],  # kNm
+            # Run total weight optimization
+            optimization_result = optimize_portal_frame_total_weight(
+                max_N_beam=0,  # Beam has no axial load
+                max_V_beam=50,  # Approximate shear force (N)
+                max_M_beam=self.current_analysis['max_moment_beam'],  # kNm
+                max_N_column=self.current_analysis['max_axial_column'],  # kN
+                max_V_column=50,  # Approximate shear force (N)
+                max_M_column=self.current_analysis['max_moment_column'],  # kNm
                 steel_grade=steel_grade,
-                section_type="IPE",
-                design_code=design_code
+                design_code=design_code,
+                beam_length=geometry['beam_length'],
+                column_length=geometry['column_length'],
+                num_columns=geometry['num_columns'],
+                beam_section_types=beam_types,
+                column_section_types=column_types
             )
             
-            # Run optimization for column (HEA sections)
-            column_optimization_result = optimize_section_selection(
-                max_N=self.current_analysis['max_axial_column'],  # kN
-                max_V=50,  # Approximate shear force (N)
-                max_M=self.current_analysis['max_moment_column'],  # kNm
-                steel_grade=steel_grade,
-                section_type="HEA",
-                design_code=design_code
-            )
-            
-            print(f"Beam result: {optimization_result}")
-            print(f"Column result: {column_optimization_result}")
+            print(f"Total weight optimization result: {optimization_result}")
             
             # Show optimization results
-            self.show_optimization_results(optimization_result, column_optimization_result, design_code)
+            self.show_total_weight_optimization_results(optimization_result, design_code, geometry)
             
         except Exception as e:
             self.status_label.configure(text=f"Optimizasyon hatası: {str(e)}")
+            print(f"Optimization error: {e}")
             
     def show_optimization_results(self, beam_result, column_result, design_code):
         """Show optimization results in a new window"""
@@ -1095,6 +1128,94 @@ class ModernPortalAnalyzer(ctk.CTk):
             update_button = ctk.CTkButton(scrollable_frame, text="Optimum Kesitleri Uygula",
                                           command=lambda: self.apply_optimal_sections(beam_result, column_result))
             update_button.pack(pady=20)
+
+    def show_total_weight_optimization_results(self, optimization_result, design_code, geometry):
+        """Show total weight optimization results in a new window"""
+        opt_window = ctk.CTkToplevel(self)
+        opt_window.title(f"Toplam Ağırlık Optimizasyonu - {design_code}")
+        opt_window.geometry("900x800")  
+        
+        # Create scrollable frame
+        scrollable_frame = ctk.CTkScrollableFrame(opt_window)
+        scrollable_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Add title
+        title_label = ctk.CTkLabel(scrollable_frame, text=f"Portal Çerçeve Toplam Ağırlık Optimizasyonu ({design_code})", 
+                                   font=ctk.CTkFont(size=16, weight="bold"))
+        title_label.pack(pady=(0, 20))
+        
+        # Geometry information
+        geom_frame = ctk.CTkFrame(scrollable_frame)
+        geom_frame.pack(fill="x", pady=(0, 10))
+        
+        ctk.CTkLabel(geom_frame, text="ÇERÇEVE GEOMETRİSİ", 
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(pady=5)
+        
+        geom_text = f"Toplam Kiriş Uzunluğu: {geometry['beam_length']:.2f} m\n"
+        geom_text += f"Toplam Kolon Uzunluğu: {geometry['total_column_length']:.2f} m\n" 
+        geom_text += f"Kolon Sayısı: {geometry['num_columns']}\n"
+        geom_text += f"Çerçeve Açıklığı: {geometry['span']:.2f} m"
+        
+        ctk.CTkLabel(geom_frame, text=geom_text, justify="left").pack(padx=20, pady=5)
+        
+        if optimization_result['status'] == 'FAILED':
+            # Show error message
+            error_frame = ctk.CTkFrame(scrollable_frame)
+            error_frame.pack(fill="x", pady=(10, 0))
+            
+            ctk.CTkLabel(error_frame, text="OPTİMİZASYON BAŞARISIZ", 
+                         font=ctk.CTkFont(size=14, weight="bold"), text_color="red").pack(pady=10)
+            
+            error_msg = optimization_result.get('message', 'Bilinmeyen hata')
+            ctk.CTkLabel(error_frame, text=f"Hata: {error_msg}", 
+                        text_color="red", justify="left").pack(padx=20, pady=5)
+            return
+        
+        # Show optimization summary
+        summary_frame = ctk.CTkFrame(scrollable_frame)
+        summary_frame.pack(fill="x", pady=(10, 0))
+        
+        ctk.CTkLabel(summary_frame, text="OPTİMİZASYON ÖZETİ", 
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(pady=10)
+        
+        optimal = optimization_result['optimal_combination']
+        summary_text = f"Kontrol Edilen Kombinasyon Sayısı: {optimization_result['total_combinations_checked']}\n"
+        summary_text += f"Güvenli Kombinasyon Sayısı: {optimization_result['total_safe_combinations']}\n\n"
+        summary_text += f"OPTIMAL KOMBINASYON:\n"
+        summary_text += f"Kiriş: {optimal['beam_section']} ({optimal['beam_weight_per_m']:.1f} kg/m)\n"
+        summary_text += f"Kolon: {optimal['column_section']} ({optimal['column_weight_per_m']:.1f} kg/m)\n\n"
+        summary_text += f"AĞIRLIK DETAYI:\n"
+        summary_text += f"Toplam Kiriş Ağırlığı: {optimal['beam_weight']:.1f} kg\n"
+        summary_text += f"Toplam Kolon Ağırlığı: {optimal['column_weight']:.1f} kg\n"
+        summary_text += f"Toplam Çerçeve Ağırlığı: {optimal['total_weight']:.1f} kg\n\n"
+        summary_text += f"KULLANIM ORANLARI:\n"
+        summary_text += f"Kiriş Kullanım Oranı: {optimal['beam_utilization']:.2f}\n"
+        summary_text += f"Kolon Kullanım Oranı: {optimal['column_utilization']:.2f}"
+        
+        ctk.CTkLabel(summary_frame, text=summary_text, justify="left").pack(padx=20, pady=5)
+        
+        # Show alternatives
+        if optimization_result['safe_combinations']:
+            alt_frame = ctk.CTkFrame(scrollable_frame)
+            alt_frame.pack(fill="x", pady=(10, 0))
+            
+            ctk.CTkLabel(alt_frame, text="ALTERNATİF ÇÖZÜMLER (İlk 10)", 
+                         font=ctk.CTkFont(size=14, weight="bold")).pack(pady=10)
+            
+            alt_text = ""
+            for i, combo in enumerate(optimization_result['safe_combinations'][:10], 1):
+                alt_text += f"{i:2d}. {combo['beam_section']} + {combo['column_section']}: "
+                alt_text += f"{combo['total_weight']:.1f} kg "
+                alt_text += f"(K:{combo['beam_utilization']:.2f}, S:{combo['column_utilization']:.2f})\n"
+            
+            ctk.CTkLabel(alt_frame, text=alt_text, justify="left", 
+                        font=ctk.CTkFont(family="Courier", size=10)).pack(padx=20, pady=5)
+        
+        # Apply optimal sections button
+        if optimization_result['status'] == 'SUCCESS':
+            apply_button = ctk.CTkButton(scrollable_frame, text="Optimal Kombinasyonu Uygula",
+                                          command=lambda: self.apply_optimal_combination(optimization_result['optimal_combination']))
+            apply_button.pack(pady=20)
 
     def apply_optimal_sections(self, beam_result, column_result):
         """Apply the optimal sections to the UI dropdowns and recalculate analysis"""
@@ -1253,7 +1374,72 @@ class ModernPortalAnalyzer(ctk.CTk):
         except Exception as e:
             print(f"DEBUG: Analysis update error: {e}")
             self.status_label.configure(text=f"Analiz güncelleme hatası: {str(e)}")
+    
+    def calculate_frame_geometry(self):
+        """Calculate portal frame geometry for total weight optimization"""
+        try:
+            # Get parameters
+            span = float(self.span_entry.get())
+            h1 = float(self.h1_entry.get()) 
+            h2 = float(self.h2_entry.get())
+            ridge = float(self.ridge_entry.get())
+            spacing = float(self.spacing_entry.get())
+            
+            # Calculate beam length (rafter length)
+            # Each rafter goes from eave to ridge
+            rafter_length = ((span/2)**2 + (ridge - h1)**2)**0.5
+            total_beam_length = 2 * rafter_length  # Two rafters per frame
+            
+            # Calculate column lengths
+            total_column_length = h1 + h2  # Two columns per frame
+            num_columns = 2
+            
+            geometry = {
+                'beam_length': total_beam_length,
+                'column_length': h1,  # Single column length
+                'total_column_length': total_column_length,
+                'num_columns': num_columns,
+                'rafter_length': rafter_length,
+                'span': span,
+                'spacing': spacing
+            }
+            
+            print(f"DEBUG: Frame geometry calculated:")
+            print(f"  Span: {span} m")
+            print(f"  Column heights: {h1}, {h2} m") 
+            print(f"  Ridge height: {ridge} m")
+            print(f"  Rafter length: {rafter_length:.2f} m")
+            print(f"  Total beam length: {total_beam_length:.2f} m")
+            print(f"  Total column length: {total_column_length:.2f} m")
+            
+            return geometry
+            
+        except Exception as e:
+            print(f"DEBUG: Error calculating frame geometry: {e}")
+            return None
 
+    def apply_optimal_combination(self, optimal_combo):
+        """Apply optimal section combination to UI"""
+        try:
+            # Apply beam section
+            beam_section = optimal_combo['beam_section'] 
+            if beam_section != self.raf_section_combo.get():
+                self.raf_section_combo.set(beam_section)
+                # Update beam properties when section changes
+                self.update_beam_properties(beam_section)
+            
+            # Apply column section
+            column_section = optimal_combo['column_section']
+            if column_section != self.col_section_combo.get():
+                self.col_section_combo.set(column_section)
+                # Update column properties when section changes
+                self.update_column_properties(column_section)
+                
+            messagebox.showinfo("Başarılı", 
+                                f"Optimal kesitler uygulandı:\nKiriş: {beam_section}\nKolon: {column_section}\nToplam Ağırlık: {optimal_combo['total_weight']:.1f} kg")
+        except Exception as e:
+            messagebox.showerror("Hata", f"Optimal kesitler uygulanırken hata: {str(e)}")
+        
 if __name__ == "__main__":
     app = ModernPortalAnalyzer()
     app.mainloop()
