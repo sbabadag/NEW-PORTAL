@@ -16,7 +16,7 @@ import threading
 from tkinter import messagebox
 
 # Import steel section checking functions
-from steel_check import check_section_resistance, format_check_results, get_section_properties, optimize_section_selection, format_optimization_results, get_hea_sections, get_ipe_sections, get_all_sections, optimize_portal_frame_total_weight
+from steel_check import check_section_resistance, format_detailed_check_results, get_section_properties, optimize_section_selection, format_optimization_results, get_hea_sections, get_ipe_sections, get_all_sections, optimize_portal_frame_total_weight, check_deflections
 
 # Set appearance mode and color theme
 ctk.set_appearance_mode("dark")  # Modes: "System" (standard), "Dark", "Light"
@@ -29,11 +29,12 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Core FEM classes and functions from portal.py
 class Node:
-    __slots__ = ("x","y","fix","load")
+    __slots__ = ("x","y","fix","load","D")
     def __init__(self, x, y, fix=(False,False,False), load=(0.0,0.0,0.0)):
         self.x = float(x); self.y = float(y)
         self.fix = tuple(bool(b) for b in fix)
         self.load = tuple(float(f) for f in load)
+        self.D = None  # Will be set after analysis
 
 class Element:
     __slots__ = ("i","j","E","A","I","w","label")
@@ -174,15 +175,72 @@ def steel_selfweight_kNpm(A_m2):
     # density* g ≈ 78.5 kN/m^3; line load along member (vertical)
     return 78.5 * A_m2
 
+def calculate_haunch_properties(base_I, base_height, height_increase):
+    """
+    Calculate moment of inertia increase due to haunch
+    Simple approach: assume rectangular section height increase
+    """
+    # For IPE sections, approximate enhanced I based on height increase
+    # This is a simplified approach - in practice would need more detailed calculation
+    
+    # Simplified approach: increase by ratio of (new_height/old_height)^3
+    # This is based on I being proportional to h³ for rectangular sections
+    height_ratio = (base_height + height_increase) / base_height
+    I_enhanced = base_I * (height_ratio ** 3)
+    
+    return I_enhanced
+
 def build_and_run(params, combo_name):
+    # Import steel section properties
+    from steel_check import get_section_properties
+    
     # Geometry
     E = params["E"]
     span = params["span"]
     h1 = params["h1"]; h2 = params["h2"]; ridge = params["ridge"]
     spacing = params["spacing"]
+    
+    # Get real section properties from database
+    column_section = params["column_section"]
+    beam_section = params["beam_section"]
+    
+    col_props = get_section_properties(column_section)
+    beam_props = get_section_properties(beam_section)
+    
+    if col_props is None or beam_props is None:
+        print(f"ERROR: Section properties not found for {column_section} or {beam_section}")
+        # Fallback to manual values
+        A_col = params["A_col"]; I_col = params["I_col"]
+        A_raf = params["A_raf"]; I_raf = params["I_raf"]
+    else:
+        # Use real section properties (convert to SI units)
+        steel_density = 7850  # kg/m³
+        A_col = col_props["G"] / steel_density  # m² from weight (kg/m)
+        I_col = col_props["I"] * 1e-8  # cm⁴ to m⁴
+        A_raf = beam_props["G"] / steel_density  # m² from weight (kg/m)
+        I_raf = beam_props["I"] * 1e-8  # cm⁴ to m⁴
+        
+        print(f"DEBUG - Gerçek kesit özellikleri:")
+        print(f"  Column {column_section}: A={A_col:.6f} m², I={I_col:.2e} m⁴ (DB: I={col_props['I']} cm⁴)")
+        print(f"  Beam {beam_section}: A={A_raf:.6f} m², I={I_raf:.2e} m⁴ (DB: I={beam_props['I']} cm⁴)")
+        
+        # Apply haunch enhancement if enabled
+        haunch_enable = params.get("haunch_enable", False)
+        if haunch_enable:
+            haunch_height_increase = params.get("haunch_height_increase", 0.2)  # meters
+            base_height = beam_props.get("h", 300) / 1000.0  # Convert mm to m
+            I_raf_enhanced = calculate_haunch_properties(I_raf, base_height, haunch_height_increase)
+            print(f"  Haunch aktif - Beam I: {I_raf*1e8:.1f} cm⁴ → {I_raf_enhanced*1e8:.1f} cm⁴ (artış: {(I_raf_enhanced/I_raf-1)*100:.1f}%)")
+            I_raf = I_raf_enhanced  # Use enhanced value for analysis
+        
+        # Sanity check: IPE 300 should have I ≈ 8356 cm⁴ = 8.356e-5 m⁴
+        # Real world IPE 300: I = 8356 cm⁴
+        # If this is too low, we might need to check our reference data
+        if beam_section == "IPE 300":
+            print(f"  IPE 300 beklenen atalet momenti: 8356 cm⁴ = 8.356e-5 m⁴")
+            print(f"  Hesaplanan: {I_raf:.2e} m⁴")
+    
     # Sections (m^2, m^4)
-    A_col = params["A_col"]; I_col = params["I_col"]
-    A_raf = params["A_raf"]; I_raf = params["I_raf"]
     label_col = params["label_col"]; label_raf = params["label_raf"]
 
     # Angles
@@ -215,33 +273,57 @@ def build_and_run(params, combo_name):
     SW_R = SW_line * cos(aR)
 
     # Combinations
-    if combo_name == "ULS (G+S)":
-        wL = 1.35*(G_L + SW_L) + 1.50*S_L
-        wR = 1.35*(G_R + SW_R) + 1.50*S_R
-        subtitle = f"ULS(G+S)  μL={muL:.2f}, μR={muR:.2f}  αL={aLdeg:.1f}°, αR={aRdeg:.1f}°"
-    elif combo_name == "ULS (G+W)":
-        wL = 1.35*(G_L + SW_L) + 1.50*(Wn_L)
-        wR = 1.35*(G_R + SW_R) + 1.50*(Wn_R)
-        subtitle = f"ULS(G+W)  αL={aLdeg:.1f}°, αR={aRdeg:.1f}°"
-    elif combo_name == "SLS (G+S)":
-        wL = (G_L + SW_L) + (S_L)
-        wR = (G_R + SW_R) + (S_R)
-        subtitle = f"SLS-char(G+S)  μL={muL:.2f}, μR={muR:.2f}  αL={aLdeg:.1f}°, αR={aRdeg:.1f}°"
-    elif combo_name == "SLS (G+W)":
-        wL = (G_L + SW_L) + (Wn_L)
-        wR = (G_R + SW_R) + (Wn_R)
-        subtitle = f"SLS-char(G+W)  αL={aLdeg:.1f}°, αR={aRdeg:.1f}°"
-    else:
-        raise ValueError("Unknown combination")
+    try:
+        if combo_name == "ULS (G+S)":
+            wL = 1.35*(G_L + SW_L) + 1.50*S_L
+            wR = 1.35*(G_R + SW_R) + 1.50*S_R
+            subtitle = f"ULS(G+S)  μL={muL:.2f}, μR={muR:.2f}  αL={aLdeg:.1f}°, αR={aRdeg:.1f}°"
+        elif combo_name == "ULS (G+W)":
+            wL = 1.35*(G_L + SW_L) + 1.50*(Wn_L)
+            wR = 1.35*(G_R + SW_R) + 1.50*(Wn_R)
+            subtitle = f"ULS(G+W)  αL={aLdeg:.1f}°, αR={aRdeg:.1f}°"
+        elif combo_name == "SLS (G+S)":
+            wL = (G_L + SW_L) + (S_L)
+            wR = (G_R + SW_R) + (S_R)
+            subtitle = f"SLS-char(G+S)  μL={muL:.2f}, μR={muR:.2f}  αL={aLdeg:.1f}°, αR={aRdeg:.1f}°"
+        elif combo_name == "SLS (G+W)":
+            wL = (G_L + SW_L) + (Wn_L)
+            wR = (G_R + SW_R) + (Wn_R)
+            subtitle = f"SLS-char(G+W)  αL={aLdeg:.1f}°, αR={aRdeg:.1f}°"
+        else:
+            raise ValueError("Unknown combination")
+            
+        print(f"  Sol kiriş (wL): {wL:.2f} kN/m -> {wL*1000:.0f} N/m")
+        print(f"  Sağ kiriş (wR): {wR:.2f} kN/m -> {wR*1000:.0f} N/m")
+        
+    except Exception as e:
+        print(f"HATA: Yük hesaplama: {e}")
+        print(f"G_L={G_L}, SW_L={SW_L}, S_L={S_L}")
+        print(f"G_R={G_R}, SW_R={SW_R}, S_R={S_R}")
+        raise
 
+    # Mesnet tipine göre fix değerlerini belirle
+    left_fix = (True, True, True) if params.get("left_support_type", "Sabit") == "Sabit" else (True, True, False)
+    right_fix = (True, True, True) if params.get("right_support_type", "Sabit") == "Sabit" else (True, True, False)
+
+    # Debug: Yük hesaplamaları
+    print(f"\nDEBUG: Yük hesaplamaları ({combo_name}):")
+    print(f"Kar yükü (s_k): {s_k} kN/m²")
+    print(f"Rüzgar yükü (pn_kNm2): {params['pn_kNm2']} kN/m²") 
+    print(f"Ölü yük (G_kNm2): {G_kNm2} kN/m²")
+    print(f"Sol açı (aL): {aLdeg:.1f}°, Sağ açı (aR): {aRdeg:.1f}°")
+    print(f"Kar katsayıları - μL: {muL:.2f}, μR: {muR:.2f}")
+    print(f"Kar yükleri - sL: {sL:.2f} kN/m², sR: {sR:.2f} kN/m²")
+    print(f"Dağıtılmış yükler:")
+    
     # Build frame (units SI: convert kN/m -> N/m)
     kNpm_to_Npm = 1e3
     nodes = [
-        Node(0.0, 0.0, fix=(True,True,True)),
+        Node(0.0, 0.0, fix=left_fix),
         Node(0.0, h1),
         Node(span/2.0, ridge),
         Node(span, h2),
-        Node(span, 0.0, fix=(True,True,True)),
+        Node(span, 0.0, fix=right_fix),
     ]
     elems = [
         Element(0,1,E,A_col,I_col, w=0.0,       label=label_col + " (kolon)"),
@@ -253,6 +335,11 @@ def build_and_run(params, combo_name):
     model = Frame2D(nodes, elems)
     model.assemble()
     model.solve()
+    
+    # Add displacement data to nodes for deflection checking
+    for i, node in enumerate(nodes):
+        node.D = model.D[i*3:(i+1)*3]  # Extract 3 DOFs for each node (x, y, rotation)
+    
     samples = model.sample_internal(npts=60)
     return nodes, elems, samples, subtitle
 
@@ -281,6 +368,9 @@ class ModernPortalAnalyzer(ctk.CTk):
             "include_selfweight": True,
             "s_k": 0.8, "Ce": 1.0, "Ct": 1.0,
             "pn_kNm2": 0.3, "wind_upward": True,
+            "haunch_enable": False,
+            "haunch_length": 1.5,
+            "haunch_height_increase": 0.2,
         }
         
         # Create UI
@@ -306,44 +396,57 @@ class ModernPortalAnalyzer(ctk.CTk):
                                           font=ctk.CTkFont(size=16, weight="bold"))
         self.geometry_label.grid(row=1, column=0, columnspan=2, padx=20, pady=(20, 10), sticky="w")
         
+        # Mesnet Tipi Seçiciler
+        self.left_support_label = ctk.CTkLabel(self.sidebar_frame, text="Sol Mesnet Tipi:")
+        self.left_support_label.grid(row=2, column=0, padx=(20, 10), pady=(0, 0), sticky="w")
+        self.left_support_combo = ctk.CTkComboBox(self.sidebar_frame, values=["Sabit", "Mafsallı"], width=100)
+        self.left_support_combo.grid(row=2, column=1, padx=(0, 20), pady=(0, 0), sticky="w")
+        self.left_support_combo.set("Sabit")
+
+        self.right_support_label = ctk.CTkLabel(self.sidebar_frame, text="Sağ Mesnet Tipi:")
+        self.right_support_label.grid(row=3, column=0, padx=(20, 10), pady=(0, 0), sticky="w")
+        self.right_support_combo = ctk.CTkComboBox(self.sidebar_frame, values=["Sabit", "Mafsallı"], width=100)
+        self.right_support_combo.grid(row=3, column=1, padx=(0, 20), pady=(0, 0), sticky="w")
+        self.right_support_combo.set("Sabit")
+
         # Span
         self.span_label = ctk.CTkLabel(self.sidebar_frame, text="Açıklık [m]:")
-        self.span_label.grid(row=2, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.span_label.grid(row=4, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         self.span_entry = ctk.CTkEntry(self.sidebar_frame, width=100)
-        self.span_entry.grid(row=2, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.span_entry.grid(row=4, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         
         # Left column height
         self.h1_label = ctk.CTkLabel(self.sidebar_frame, text="Sol kolon [m]:")
-        self.h1_label.grid(row=3, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.h1_label.grid(row=5, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         self.h1_entry = ctk.CTkEntry(self.sidebar_frame, width=100)
-        self.h1_entry.grid(row=3, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.h1_entry.grid(row=5, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         
         # Right column height
         self.h2_label = ctk.CTkLabel(self.sidebar_frame, text="Sağ kolon [m]:")
-        self.h2_label.grid(row=4, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.h2_label.grid(row=6, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         self.h2_entry = ctk.CTkEntry(self.sidebar_frame, width=100)
-        self.h2_entry.grid(row=4, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.h2_entry.grid(row=6, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         
         # Ridge height
         self.ridge_label = ctk.CTkLabel(self.sidebar_frame, text="Mahya [m]:")
-        self.ridge_label.grid(row=5, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.ridge_label.grid(row=7, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         self.ridge_entry = ctk.CTkEntry(self.sidebar_frame, width=100)
-        self.ridge_entry.grid(row=5, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.ridge_entry.grid(row=7, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         
         # Frame spacing
         self.spacing_label = ctk.CTkLabel(self.sidebar_frame, text="Çerçeve aralığı [m]:")
-        self.spacing_label.grid(row=6, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.spacing_label.grid(row=8, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         self.spacing_entry = ctk.CTkEntry(self.sidebar_frame, width=100)
-        self.spacing_entry.grid(row=6, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.spacing_entry.grid(row=8, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         
         # Sections
         self.sections_label = ctk.CTkLabel(self.sidebar_frame, text="Kesitler",
                                           font=ctk.CTkFont(size=16, weight="bold"))
-        self.sections_label.grid(row=7, column=0, columnspan=2, padx=20, pady=(20, 10), sticky="w")
+        self.sections_label.grid(row=9, column=0, columnspan=2, padx=20, pady=(20, 10), sticky="w")
         
         # Column section
         self.col_section_label = ctk.CTkLabel(self.sidebar_frame, text="Kolon kesit:")
-        self.col_section_label.grid(row=8, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.col_section_label.grid(row=10, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         
         # Get all sections from database (HEA + IPE for flexibility)
         all_sections = get_all_sections()
@@ -353,23 +456,23 @@ class ModernPortalAnalyzer(ctk.CTk):
                                                values=all_sections,
                                                width=120,
                                                command=self.update_column_properties)
-        self.col_section_combo.grid(row=8, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.col_section_combo.grid(row=10, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         
         # Column area
         self.Acol_label = ctk.CTkLabel(self.sidebar_frame, text="A_kolon [cm²]:")
-        self.Acol_label.grid(row=9, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.Acol_label.grid(row=11, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         self.Acol_entry = ctk.CTkEntry(self.sidebar_frame, width=100)
-        self.Acol_entry.grid(row=9, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.Acol_entry.grid(row=11, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         
         # Column moment of inertia
         self.Icol_label = ctk.CTkLabel(self.sidebar_frame, text="I_kolon [cm⁴]:")
-        self.Icol_label.grid(row=10, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.Icol_label.grid(row=12, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         self.Icol_entry = ctk.CTkEntry(self.sidebar_frame, width=100)
-        self.Icol_entry.grid(row=10, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.Icol_entry.grid(row=12, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         
         # Rafter section
         self.raf_section_label = ctk.CTkLabel(self.sidebar_frame, text="Kiriş kesit:")
-        self.raf_section_label.grid(row=11, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.raf_section_label.grid(row=13, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         
         # Get all sections from database (IPE + HEA for flexibility)
         all_sections_beam = get_all_sections()
@@ -379,92 +482,116 @@ class ModernPortalAnalyzer(ctk.CTk):
                                                values=all_sections_beam,
                                                width=120,
                                                command=self.update_beam_properties)
-        self.raf_section_combo.grid(row=11, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.raf_section_combo.grid(row=13, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         
         # Rafter area
         self.Araf_label = ctk.CTkLabel(self.sidebar_frame, text="A_kiriş [cm²]:")
-        self.Araf_label.grid(row=12, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.Araf_label.grid(row=14, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         self.Araf_entry = ctk.CTkEntry(self.sidebar_frame, width=100)
-        self.Araf_entry.grid(row=12, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.Araf_entry.grid(row=14, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         
         # Rafter moment of inertia
         self.Iraf_label = ctk.CTkLabel(self.sidebar_frame, text="I_kiriş [cm⁴]:")
-        self.Iraf_label.grid(row=13, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.Iraf_label.grid(row=15, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         self.Iraf_entry = ctk.CTkEntry(self.sidebar_frame, width=100)
-        self.Iraf_entry.grid(row=13, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.Iraf_entry.grid(row=15, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        
+        # Haunch parameters
+        self.haunch_label = ctk.CTkLabel(self.sidebar_frame, text="Haunch (Konsol)",
+                                        font=ctk.CTkFont(size=14, weight="bold"))
+        self.haunch_label.grid(row=16, column=0, columnspan=2, padx=20, pady=(15, 5), sticky="w")
+        
+        # Haunch enable checkbox
+        self.haunch_enable = ctk.CTkCheckBox(self.sidebar_frame, text="Haunch uygula",
+                                           command=self.toggle_haunch_controls)
+        self.haunch_enable.grid(row=17, column=0, columnspan=2, padx=20, pady=(5, 0), sticky="w")
+        
+        # Haunch length
+        self.haunch_length_label = ctk.CTkLabel(self.sidebar_frame, text="Haunch uzunluk [m]:")
+        self.haunch_length_label.grid(row=18, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.haunch_length_entry = ctk.CTkEntry(self.sidebar_frame, width=100)
+        self.haunch_length_entry.grid(row=18, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.haunch_length_entry.insert(0, "1.5")  # Default 1.5m
+        
+        # Haunch height increase
+        self.haunch_height_label = ctk.CTkLabel(self.sidebar_frame, text="Yükseklik artışı [cm]:")
+        self.haunch_height_label.grid(row=19, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.haunch_height_entry = ctk.CTkEntry(self.sidebar_frame, width=100)
+        self.haunch_height_entry.grid(row=19, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.haunch_height_entry.insert(0, "20")  # Default 20cm increase
         
         # Loads
         self.loads_label = ctk.CTkLabel(self.sidebar_frame, text="Yükler",
                                        font=ctk.CTkFont(size=16, weight="bold"))
-        self.loads_label.grid(row=14, column=0, columnspan=2, padx=20, pady=(20, 10), sticky="w")
+        self.loads_label.grid(row=20, column=0, columnspan=2, padx=20, pady=(20, 10), sticky="w")
         
         # Dead load
         self.G_label = ctk.CTkLabel(self.sidebar_frame, text="G (çatı) [kN/m²]:")
-        self.G_label.grid(row=15, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.G_label.grid(row=21, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         self.G_entry = ctk.CTkEntry(self.sidebar_frame, width=100)
-        self.G_entry.grid(row=15, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.G_entry.grid(row=21, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         
         # Self-weight checkbox
         self.sw_check = ctk.CTkCheckBox(self.sidebar_frame, text="Kiriş öz-ağırlık dahil")
-        self.sw_check.grid(row=16, column=0, columnspan=2, padx=20, pady=(10, 0), sticky="w")
+        self.sw_check.grid(row=22, column=0, columnspan=2, padx=20, pady=(10, 0), sticky="w")
         
         # Snow load
         self.sk_label = ctk.CTkLabel(self.sidebar_frame, text="s_k (kar) [kN/m²]:")
-        self.sk_label.grid(row=17, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.sk_label.grid(row=23, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         self.sk_entry = ctk.CTkEntry(self.sidebar_frame, width=100)
-        self.sk_entry.grid(row=17, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.sk_entry.grid(row=23, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         
         # Wind load
         self.pn_label = ctk.CTkLabel(self.sidebar_frame, text="p_n (rüzgar) [kN/m²]:")
-        self.pn_label.grid(row=18, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.pn_label.grid(row=24, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         self.pn_entry = ctk.CTkEntry(self.sidebar_frame, width=100)
-        self.pn_entry.grid(row=18, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.pn_entry.grid(row=24, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         
         # Wind direction
         self.wind_check = ctk.CTkCheckBox(self.sidebar_frame, text="Rüzgar yukarı (+)")
-        self.wind_check.grid(row=19, column=0, columnspan=2, padx=20, pady=(10, 0), sticky="w")
+        self.wind_check.grid(row=25, column=0, columnspan=2, padx=20, pady=(10, 0), sticky="w")
         
         # Steel grade selection
         self.steel_grade_label = ctk.CTkLabel(self.sidebar_frame, text="Çelik sınıfı:")
-        self.steel_grade_label.grid(row=20, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.steel_grade_label.grid(row=26, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         self.steel_grade_combo = ctk.CTkComboBox(self.sidebar_frame,
                                                values=["S235", "S275", "S355"],
                                                width=120)
-        self.steel_grade_combo.grid(row=20, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.steel_grade_combo.grid(row=26, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         self.steel_grade_combo.set("S275")  # Default value
         
         # Design code selection
         self.design_code_label = ctk.CTkLabel(self.sidebar_frame, text="Hesaplama yöntemi:")
-        self.design_code_label.grid(row=21, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
+        self.design_code_label.grid(row=27, column=0, padx=(20, 10), pady=(10, 0), sticky="w")
         self.design_code_combo = ctk.CTkComboBox(self.sidebar_frame,
                                                values=["Eurocode 3 (EN)", "TS 648 (Türk)", "ÇYTHYE (Türk)", "TBDY 2018 (Türk)"],
                                                width=140)
-        self.design_code_combo.grid(row=21, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
+        self.design_code_combo.grid(row=27, column=1, padx=(0, 20), pady=(10, 0), sticky="w")
         self.design_code_combo.set("Eurocode 3 (EN)")  # Default value
         
         # Load combinations
         self.combos_label = ctk.CTkLabel(self.sidebar_frame, text="Kombinasyonlar",
                                         font=ctk.CTkFont(size=16, weight="bold"))
-        self.combos_label.grid(row=22, column=0, columnspan=2, padx=20, pady=(20, 10), sticky="w")
+        self.combos_label.grid(row=28, column=0, columnspan=2, padx=20, pady=(20, 10), sticky="w")
         
         self.uls_gs_check = ctk.CTkCheckBox(self.sidebar_frame, text="ULS (G+S)")
-        self.uls_gs_check.grid(row=23, column=0, padx=(20, 10), pady=(5, 0), sticky="w")
+        self.uls_gs_check.grid(row=29, column=0, padx=(20, 10), pady=(5, 0), sticky="w")
         
         self.uls_gw_check = ctk.CTkCheckBox(self.sidebar_frame, text="ULS (G+W)")
-        self.uls_gw_check.grid(row=23, column=1, padx=(0, 20), pady=(5, 0), sticky="w")
+        self.uls_gw_check.grid(row=29, column=1, padx=(0, 20), pady=(5, 0), sticky="w")
         
         self.sls_gs_check = ctk.CTkCheckBox(self.sidebar_frame, text="SLS (G+S)")
-        self.sls_gs_check.grid(row=24, column=0, padx=(20, 10), pady=(5, 0), sticky="w")
+        self.sls_gs_check.grid(row=30, column=0, padx=(20, 10), pady=(5, 0), sticky="w")
         
         self.sls_gw_check = ctk.CTkCheckBox(self.sidebar_frame, text="SLS (G+W)")
-        self.sls_gw_check.grid(row=24, column=1, padx=(0, 20), pady=(5, 0), sticky="w")
+        self.sls_gw_check.grid(row=30, column=1, padx=(0, 20), pady=(5, 0), sticky="w")
         
         # Calculate button
         self.calc_button = ctk.CTkButton(self.sidebar_frame, text="Hesapla ve Çiz",
                                         command=self.calculate_analysis,
                                         font=ctk.CTkFont(size=16, weight="bold"),
                                         height=40)
-        self.calc_button.grid(row=25, column=0, columnspan=2, padx=20, pady=20, sticky="ew")
+        self.calc_button.grid(row=31, column=0, columnspan=2, padx=20, pady=20, sticky="ew")
         
         # Steel verification button
         self.verify_btn = ctk.CTkButton(self.sidebar_frame, text="Tahkik Et", 
@@ -472,7 +599,7 @@ class ModernPortalAnalyzer(ctk.CTk):
                                        fg_color="darkgreen", 
                                        hover_color="green",
                                        font=ctk.CTkFont(size=14, weight="bold"))
-        self.verify_btn.grid(row=26, column=0, columnspan=2, padx=20, pady=(0, 10), sticky="ew")
+        self.verify_btn.grid(row=32, column=0, columnspan=2, padx=20, pady=(0, 10), sticky="ew")
         
         # Optimization button
         self.optimize_btn = ctk.CTkButton(self.sidebar_frame, text="Optimize Et", 
@@ -480,11 +607,26 @@ class ModernPortalAnalyzer(ctk.CTk):
                                          fg_color="orange", 
                                          hover_color="darkorange",
                                          font=ctk.CTkFont(size=14, weight="bold"))
-        self.optimize_btn.grid(row=27, column=0, columnspan=2, padx=20, pady=(0, 10), sticky="ew")
+        self.optimize_btn.grid(row=33, column=0, columnspan=2, padx=20, pady=(0, 10), sticky="ew")
         
         # Status label
         self.status_label = ctk.CTkLabel(self.sidebar_frame, text="Hazır")
-        self.status_label.grid(row=28, column=0, columnspan=2, padx=20, pady=(10, 20), sticky="ew")
+        self.status_label.grid(row=34, column=0, columnspan=2, padx=20, pady=(10, 20), sticky="ew")
+    
+    def toggle_haunch_controls(self):
+        """Toggle haunch parameter visibility based on checkbox state"""
+        if self.haunch_enable.get():
+            # Show haunch controls
+            self.haunch_length_label.grid()
+            self.haunch_length_entry.grid()
+            self.haunch_height_label.grid()
+            self.haunch_height_entry.grid()
+        else:
+            # Hide haunch controls
+            self.haunch_length_label.grid_remove()
+            self.haunch_length_entry.grid_remove()
+            self.haunch_height_label.grid_remove()
+            self.haunch_height_entry.grid_remove()
     
     def create_main_frame(self):
         """Create the main frame with graphics display"""
@@ -527,6 +669,15 @@ class ModernPortalAnalyzer(ctk.CTk):
         self.sk_entry.insert(0, str(self.default_params["s_k"]))
         self.pn_entry.insert(0, str(self.default_params["pn_kNm2"]))
         self.wind_check.select() if self.default_params["wind_upward"] else self.wind_check.deselect()
+        
+        # Haunch defaults
+        if self.default_params["haunch_enable"]:
+            self.haunch_enable.select()
+        else:
+            self.haunch_enable.deselect()
+        self.haunch_length_entry.insert(0, str(self.default_params["haunch_length"]))
+        self.haunch_height_entry.insert(0, str(self.default_params["haunch_height_increase"]*100))  # Convert m to cm for display
+        self.toggle_haunch_controls()  # Set initial visibility
         
         # Default combinations
         self.uls_gs_check.select()
@@ -587,6 +738,11 @@ class ModernPortalAnalyzer(ctk.CTk):
                 "Ct": 1.0,
                 "pn_kNm2": float(self.pn_entry.get()),
                 "wind_upward": self.wind_check.get(),
+                "left_support_type": self.left_support_combo.get(),
+                "right_support_type": self.right_support_combo.get(),
+                "haunch_enable": self.haunch_enable.get(),
+                "haunch_length": float(self.haunch_length_entry.get()) if self.haunch_enable.get() else 1.5,
+                "haunch_height_increase": float(self.haunch_height_entry.get())/100.0 if self.haunch_enable.get() else 0.2,  # Convert cm to m
             }
             print(f"DEBUG: Parametreler başarıyla oluşturuldu")
             return params
@@ -948,21 +1104,68 @@ class ModernPortalAnalyzer(ctk.CTk):
                 content += f"  Kesme Kuvveti (V): {max_V:.2f} kN\n"
                 content += f"  Moment (M): {max_M:.2f} kNm\n\n"
                 
-                # Format and add results to content
-                content += f"Kiriş Tahkiki ({current_beam_section}):\n"
-                if beam_check['safety']:
-                    content += f"  ✓ GÜVENLİ - Kullanım: {beam_check['utilization']:.2f}\n"
-                else:
-                    content += f"  ✗ GÜVENSİZ - Kullanım: {beam_check['utilization']:.2f}\n"
+                # Format and add results to content with detailed formulas
+                content += f"{'═'*50}\n"
+                content += f"DETAYLI KESİT TAHKİK SONUÇLARI\n"
+                content += f"{'═'*50}\n\n"
                 
-                content += f"Kolon Tahkiki ({current_column_section}):\n"
-                if column_check['safety']:
-                    content += f"  ✓ GÜVENLİ - Kullanım: {column_check['utilization']:.2f}\n"
-                else:
-                    content += f"  ✗ GÜVENSİZ - Kullanım: {column_check['utilization']:.2f}\n"
+                # Add detailed beam check results
+                content += format_detailed_check_results(beam_check)
+                content += f"\n{'═'*50}\n\n"
+                
+                # Add detailed column check results  
+                content += format_detailed_check_results(column_check)
+                content += f"\n{'═'*50}\n\n"
                 
                 # Check if this combination is safe
                 combo_safe = beam_check['safety'] and column_check['safety']
+                
+                # Add deflection check for all combinations
+                # Get frame geometry from analysis parameters
+                span = analysis['params']['span']
+                h1 = analysis['params']['h1'] 
+                h2 = analysis['params']['h2']
+                
+                # Check deflections
+                deflection_check = check_deflections(nodes, span, h1, h2, design_code)
+                
+                content += f"DETAYLI SEHİM KONTROLÜ\n"
+                content += f"{'═'*50}\n\n"
+                
+                if 'error' in deflection_check:
+                    content += f"⚠ Hata: {deflection_check['error']}\n"
+                    combo_safe = False
+                else:
+                    content += f"Tasarım Kodu: {deflection_check['design_code']} ({deflection_check['standard_ref']})\n"
+                    content += f"Çerçeve Geometrisi: Açıklık = {span:.1f} m, Ortalama Yükseklik = {(h1+h2)/2:.1f} m\n\n"
+                    
+                    # Detailed vertical deflection check
+                    if 'detailed_calculations' in deflection_check:
+                        v_calc = deflection_check['detailed_calculations']['vertical']
+                        content += f"1. DÜŞEY SEHİM KONTROLÜ:\n"
+                        content += f"  Formül: {v_calc['formula']}\n"
+                        content += f"  Hesaplama: {v_calc['calculation']}\n"
+                        content += f"  Ölçülen: {v_calc['measured']}\n"
+                        content += f"  Kontrol: {v_calc['check']}\n"
+                        content += f"  Durum: {v_calc['status']}\n"
+                        content += f"  Kullanım Oranı: {v_calc['utilization']:.3f}\n"
+                        content += f"  Referans: {v_calc['reference']}\n\n"
+                        
+                        h_calc = deflection_check['detailed_calculations']['horizontal']
+                        content += f"2. YATAY SEHİM KONTROLÜ:\n"
+                        content += f"  Formül: {h_calc['formula']}\n"
+                        content += f"  Hesaplama: {h_calc['calculation']}\n"
+                        content += f"  Ölçülen: {h_calc['measured']}\n"
+                        content += f"  Kontrol: {h_calc['check']}\n"
+                        content += f"  Durum: {h_calc['status']}\n"
+                        content += f"  Kullanım Oranı: {h_calc['utilization']:.3f}\n"
+                        content += f"  Referans: {h_calc['reference']}\n\n"
+                    
+                    # Update combination safety with deflection results
+                    combo_safe = combo_safe and deflection_check['overall_ok']
+                    
+                content += f"{'═'*50}\n\n"
+                
                 overall_safe = overall_safe and combo_safe
                 
                 content += f"\n{combo_name} Sonucu: {'✓ GÜVENLİ' if combo_safe else '✗ GÜVENSİZ'}\n\n"
@@ -974,11 +1177,11 @@ class ModernPortalAnalyzer(ctk.CTk):
         # Overall result
         content += f"{'='*60}\n"
         if overall_safe:
-            content += f"GENEL SONUÇ: ✓ TÜM KESİTLER GÜVENLİ\n"
-            content += f"Seçilen kesitler tüm yük kombinasyonları için yeterlidir.\n"
+            content += f"GENEL SONUÇ: ✓ TÜM KONTROLLER GÜVENLİ\n"
+            content += f"Seçilen kesitler tüm yük kombinasyonları için mukavemet ve sehim açısından yeterlidir.\n"
         else:
-            content += f"GENEL SONUÇ: ✗ BİR VEYA DAHA FAZLA KESİT GÜVENSİZ\n"
-            content += f"Kesit boyutları artırılmalı veya çelik sınıfı yükseltilmelidir.\n"
+            content += f"GENEL SONUÇ: ✗ BİR VEYA DAHA FAZLA KONTROL GÜVENSİZ\n"
+            content += f"Kesit boyutları artırılmalı, çelik sınıfı yükseltilmeli veya sehim limitleri gözden geçirilmelidir.\n"
         content += f"{'='*60}\n"
         
         # Insert content into text widget
@@ -1007,23 +1210,17 @@ class ModernPortalAnalyzer(ctk.CTk):
             current_beam_section = self.raf_section_combo.get()
             current_column_section = self.col_section_combo.get()
             
-            # Determine section types for optimization
-            beam_types = []
-            column_types = []
+            # Determine section types for optimization - Always include both types for comprehensive optimization
+            beam_types = ["IPE", "HEA"]  # Always optimize both types for beams
+            column_types = ["IPE", "HEA"]  # Always optimize both types for columns
             
-            if current_beam_section.startswith("IPE") or current_beam_section == "Özel":
-                beam_types.append("IPE")
-            if current_beam_section.startswith("HEA"):
-                beam_types.append("HEA")
-            if not beam_types:  # Default to both types
-                beam_types = ["IPE", "HEA"]
-                
-            if current_column_section.startswith("HEA") or current_column_section == "Özel":
-                column_types.append("HEA") 
-            if current_column_section.startswith("IPE"):
-                column_types.append("IPE")
-            if not column_types:  # Default to both types
-                column_types = ["IPE", "HEA"]
+            # Optional: respect current selection if you want to limit search space
+            # if current_beam_section.startswith("IPE") or current_beam_section == "Özel":
+            #     beam_types.append("IPE")
+            # if current_beam_section.startswith("HEA"):
+            #     beam_types.append("HEA")
+            # if not beam_types:  # Default to both types
+            #     beam_types = ["IPE", "HEA"]
             
             self.status_label.configure(text="Toplam ağırlık optimizasyonu yapılıyor...")
             
@@ -1034,6 +1231,13 @@ class ModernPortalAnalyzer(ctk.CTk):
             print(f"Max axial column: {self.current_analysis['max_axial_column']}")
             print(f"Beam optimization types: {beam_types} (current: {current_beam_section})")
             print(f"Column optimization types: {column_types} (current: {current_column_section})")
+            
+            # Get haunch parameters
+            haunch_enable = self.haunch_enable.get()
+            haunch_length = float(self.haunch_length_entry.get()) if haunch_enable else 0.0
+            haunch_height_increase = float(self.haunch_height_entry.get())/100.0 if haunch_enable else 0.0  # Convert cm to m
+            
+            print(f"Haunch parameters - Enable: {haunch_enable}, Length: {haunch_length}m, Height increase: {haunch_height_increase}m")
             
             # Run total weight optimization
             optimization_result = optimize_portal_frame_total_weight(
@@ -1049,7 +1253,10 @@ class ModernPortalAnalyzer(ctk.CTk):
                 column_length=geometry['column_length'],
                 num_columns=geometry['num_columns'],
                 beam_section_types=beam_types,
-                column_section_types=column_types
+                column_section_types=column_types,
+                haunch_enable=haunch_enable,
+                haunch_length=haunch_length,
+                haunch_height_increase=haunch_height_increase
             )
             
             print(f"Total weight optimization result: {optimization_result}")
@@ -1166,7 +1373,7 @@ class ModernPortalAnalyzer(ctk.CTk):
             ctk.CTkLabel(error_frame, text="OPTİMİZASYON BAŞARISIZ", 
                          font=ctk.CTkFont(size=14, weight="bold"), text_color="red").pack(pady=10)
             
-            error_msg = optimization_result.get('message', 'Bilinmeyen hata')
+            error_msg = optimization_result.get('error', 'Bilinmeyen hata')
             ctk.CTkLabel(error_frame, text=f"Hata: {error_msg}", 
                         text_color="red", justify="left").pack(padx=20, pady=5)
             return
@@ -1178,24 +1385,40 @@ class ModernPortalAnalyzer(ctk.CTk):
         ctk.CTkLabel(summary_frame, text="OPTİMİZASYON ÖZETİ", 
                      font=ctk.CTkFont(size=14, weight="bold")).pack(pady=10)
         
-        optimal = optimization_result['optimal_combination']
+        optimal = optimization_result['best_combination']
         summary_text = f"Kontrol Edilen Kombinasyon Sayısı: {optimization_result['total_combinations_checked']}\n"
-        summary_text += f"Güvenli Kombinasyon Sayısı: {optimization_result['total_safe_combinations']}\n\n"
+        summary_text += f"Güvenli Kombinasyon Sayısı: {optimization_result['valid_combinations_count']}\n\n"
+        
+        # Add haunch information if enabled
+        if optimization_result.get('haunch', {}).get('enabled', False):
+            haunch_info = optimization_result['haunch']
+            summary_text += f"HAUNCH (KONSOL) BİLGİSİ:\n"
+            summary_text += f"Haunch Uzunluğu: {haunch_info['length']:.2f} m\n"
+            summary_text += f"Yükseklik Artışı: {haunch_info['height_increase']*100:.0f} cm\n"
+            summary_text += f"Etkin Moment (Haunch ile): {optimal.get('effective_max_M_beam', 0):.1f} kNm\n\n"
+        
         summary_text += f"OPTIMAL KOMBINASYON:\n"
         summary_text += f"Kiriş: {optimal['beam_section']} ({optimal['beam_weight_per_m']:.1f} kg/m)\n"
         summary_text += f"Kolon: {optimal['column_section']} ({optimal['column_weight_per_m']:.1f} kg/m)\n\n"
         summary_text += f"AĞIRLIK DETAYI:\n"
-        summary_text += f"Toplam Kiriş Ağırlığı: {optimal['beam_weight']:.1f} kg\n"
-        summary_text += f"Toplam Kolon Ağırlığı: {optimal['column_weight']:.1f} kg\n"
+        summary_text += f"Toplam Kiriş Ağırlığı: {optimal['total_beam_weight']:.1f} kg\n"
+        summary_text += f"Toplam Kolon Ağırlığı: {optimal['total_column_weight']:.1f} kg\n"
         summary_text += f"Toplam Çerçeve Ağırlığı: {optimal['total_weight']:.1f} kg\n\n"
         summary_text += f"KULLANIM ORANLARI:\n"
-        summary_text += f"Kiriş Kullanım Oranı: {optimal['beam_utilization']:.2f}\n"
-        summary_text += f"Kolon Kullanım Oranı: {optimal['column_utilization']:.2f}"
+        summary_text += f"Kiriş Kullanım Oranı: {optimal['beam_check'].get('utilization', 0):.2f}\n"
+        summary_text += f"Kolon Kullanım Oranı: {optimal['column_check'].get('utilization', 0):.2f}\n"
+        
+        # Add buckling information if available
+        if optimal.get('column_buckling_check'):
+            buckling = optimal['column_buckling_check']
+            summary_text += f"Kolon Burkulma Oranı: {buckling.get('utilization', 0):.2f}\n"
+            summary_text += f"Normalleştirilmiş Narinlik: {buckling.get('normalized_slenderness', 0):.2f}\n"
+            summary_text += f"Burkulma Azaltma Faktörü: {buckling.get('reduction_factor', 0):.2f}"
         
         ctk.CTkLabel(summary_frame, text=summary_text, justify="left").pack(padx=20, pady=5)
         
         # Show alternatives
-        if optimization_result['safe_combinations']:
+        if optimization_result['all_combinations']:
             alt_frame = ctk.CTkFrame(scrollable_frame)
             alt_frame.pack(fill="x", pady=(10, 0))
             
@@ -1203,10 +1426,13 @@ class ModernPortalAnalyzer(ctk.CTk):
                          font=ctk.CTkFont(size=14, weight="bold")).pack(pady=10)
             
             alt_text = ""
-            for i, combo in enumerate(optimization_result['safe_combinations'][:10], 1):
+            for i, combo in enumerate(optimization_result['all_combinations'][:10], 1):
+                beam_util = combo['beam_check'].get('utilization', 0)
+                column_util = combo['column_check'].get('utilization', 0)
+                buckling_util = combo.get('column_buckling_check', {}).get('utilization', 0)
                 alt_text += f"{i:2d}. {combo['beam_section']} + {combo['column_section']}: "
                 alt_text += f"{combo['total_weight']:.1f} kg "
-                alt_text += f"(K:{combo['beam_utilization']:.2f}, S:{combo['column_utilization']:.2f})\n"
+                alt_text += f"(K:{beam_util:.2f}, S:{column_util:.2f}, B:{buckling_util:.2f})\n"
             
             ctk.CTkLabel(alt_frame, text=alt_text, justify="left", 
                         font=ctk.CTkFont(family="Courier", size=10)).pack(padx=20, pady=5)
@@ -1214,7 +1440,7 @@ class ModernPortalAnalyzer(ctk.CTk):
         # Apply optimal sections button
         if optimization_result['status'] == 'SUCCESS':
             apply_button = ctk.CTkButton(scrollable_frame, text="Optimal Kombinasyonu Uygula",
-                                          command=lambda: self.apply_optimal_combination(optimization_result['optimal_combination']))
+                                          command=lambda: self.apply_optimal_combination(optimization_result['best_combination']))
             apply_button.pack(pady=20)
 
     def apply_optimal_sections(self, beam_result, column_result):
@@ -1278,6 +1504,7 @@ class ModernPortalAnalyzer(ctk.CTk):
             try:
                 props = get_section_properties(column_result['optimal_section'])
                 print(f"DEBUG: Column properties alındı: {props}")
+                
                 
                 old_A = self.Acol_entry.get()
                 old_I = self.Icol_entry.get()
